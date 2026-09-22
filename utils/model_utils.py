@@ -1,37 +1,33 @@
 import os
 import json
 from pathlib import Path
-import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image
 import streamlit as st
 
 # Pfade definieren (Hauptverzeichnis des Projekts)
 BASE_DIR = Path(__file__).resolve().parent.parent
-MODEL_PATH = BASE_DIR / "model" / "keras_model.h5"
+MODEL_PATH = BASE_DIR / "model" / "best.pt"
 CONFIG_PATH = BASE_DIR / "model" / "model_config.json"
 LABELS_PATH = BASE_DIR / "model" / "labels.txt"
 
-# Falls Hugging Face verwendet werden soll, Repository hier anpassen
-HF_REPO_ID = st.secrets.get("HF_REPO_ID", None)  # z. B. "user/fundbuero-model"
-HF_FILENAME = st.secrets.get("HF_FILENAME", "model.h5")
+# Hugging Face Secrets aus Streamlit Cloud auslesen
+HF_REPO_ID = st.secrets.get("HF_REPO_ID", None)  # z. B. "user/fundbuero-yolo"
+HF_FILENAME = st.secrets.get("HF_FILENAME", "best.pt")
 
 
 def load_config() -> dict:
     """Lädt die Konfigurationsdatei für das Modell."""
     default_config = {
-        "image_width": 224,
-        "image_height": 224,
-        "normalization": "0_1",
-        "confidence_threshold": 0.55,
-        "model_type": "keras_h5"
+        "confidence_threshold": 0.25,
+        "model_type": "yolo"
     }
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 default_config.update(config)
-        except Exception as e:
-            st.warning(f"Hinweis: Config konnte nicht geladen werden ({e}). Standardwerte werden genutzt.")
+        except Exception:
+            pass
     return default_config
 
 
@@ -47,7 +43,6 @@ def load_labels() -> list:
                 line = line.strip()
                 if not line:
                     continue
-                # Zahlenpräfixe wie "0 T-Shirt" oder "1: Pullover" entfernen
                 parts = line.split(" ", 1)
                 if len(parts) > 1 and parts[0].replace(":", "").replace("-", "").isdigit():
                     clean_label = parts[1].strip()
@@ -56,20 +51,18 @@ def load_labels() -> list:
                 labels.append(clean_label)
 
         return labels if labels else ["Sonstiges"]
-    except Exception as e:
-        st.error(f"Fehler beim Lesen von labels.txt: {e}")
+    except Exception:
         return ["Sonstiges"]
 
 
 @st.cache_resource
-def load_keras_model():
+def load_yolo_model():
     """
-    Lädt das Modell aus dem lokalen Pfad oder lädt es von Hugging Face herunter.
-    Gibt None zurück, falls kein Modell verfügbar ist.
+    Lädt das YOLO-Modell (.pt) aus dem lokalen Ordner oder lädt es von Hugging Face herunter.
     """
     target_path = MODEL_PATH
 
-    # 1. Prüfen, ob Download von Hugging Face gewünscht ist
+    # 1. Download von Hugging Face, falls nicht lokal vorhanden
     if not target_path.exists() and HF_REPO_ID:
         try:
             from huggingface_hub import hf_hub_download
@@ -84,77 +77,77 @@ def load_keras_model():
         except Exception as e:
             st.warning(f"Hugging Face Download fehlgeschlagen: {e}")
 
-    # 2. Prüfen, ob die Modelldatei lokal existiert
+    # 2. Prüfen, ob Modell existiert
     if not target_path.exists():
         return None
 
-    # 3. Keras / TensorFlow Modell laden
+    # 3. YOLO Modell via Ultralytics laden
     try:
-        import tensorflow as tf
-        model = tf.keras.models.load_model(str(target_path), compile=False)
+        from ultralytics import YOLO
+        model = YOLO(str(target_path))
         return model
     except Exception as e:
-        st.error(f"Fehler beim Laden des Keras-Modells (`{target_path.name}`): {e}")
+        st.error(f"Fehler beim Laden des YOLO-Modells (`{target_path.name}`): {e}")
         return None
 
 
 def predict_clothing(image_file) -> dict:
-    """Führt die Klassifizierung des hochgeladenen Bildes durch."""
+    """Führt die YOLO-Erkennung auf dem hochgeladenen Bild aus."""
     config = load_config()
-    labels = load_labels()
-    model = load_keras_model()
+    model = load_yolo_model()
 
-    # Fallback, wenn kein Modell geladen werden konnte
     if model is None:
         return {
-            "label": "Sonstiges (KI-Modell nicht geladen)",
+            "label": "Sonstiges (YOLO-Modell nicht geladen)",
             "confidence": 0.0,
             "probabilities": {}
         }
 
     try:
-        # Bild vorbereiten
+        # Bild öffnen
         img = Image.open(image_file).convert("RGB")
-        target_size = (config.get("image_width", 224), config.get("image_height", 224))
-        img = ImageOps.fit(img, target_size, Image.Resampling.LANCZOS)
 
-        # In Numpy-Array umwandeln
-        img_array = np.asarray(img, dtype=np.float32)
+        # YOLO Inferenz ausführen
+        results = model(img)
+        result = results[0]
 
-        # Normalisierung anwenden
-        norm_type = config.get("normalization", "0_1")
-        if norm_type == "0_1":
-            img_array = img_array / 255.0
-        elif norm_type == "minus1_1":
-            img_array = (img_array / 127.5) - 1.0
+        # A) Falls es ein YOLO-Klassifikationsmodell ist (Cls)
+        if hasattr(result, "probs") and result.probs is not None:
+            top_class_id = int(result.probs.top1)
+            top_conf = float(result.probs.top1conf)
+            top_label = result.names[top_class_id]
 
-        # Batch-Dimension hinzufügen
-        img_array = np.expand_dims(img_array, axis=0)
+            # Top 3 extrahieren
+            top3_ids = result.probs.top5[:3] if hasattr(result.probs, "top5") else [top_class_id]
+            probs_dict = {result.names[int(cid)]: float(result.probs.data[int(cid)]) for cid in top3_ids}
 
-        # Vorhersage
-        preds = model.predict(img_array)[0]
+        # B) Falls es ein YOLO-Objekterkennungsmodell ist (Det)
+        elif hasattr(result, "boxes") and result.boxes is not None and len(result.boxes) > 0:
+            # Höchste Konfidenz unter den gefundenen Boxen wählen
+            best_box = max(result.boxes, key=lambda b: float(b.conf[0]))
+            top_class_id = int(best_box.cls[0])
+            top_conf = float(best_box.conf[0])
+            top_label = result.names[top_class_id]
 
-        # Wahrscheinlichkeiten zuordnen
-        probs = {}
-        for idx, prob in enumerate(preds):
-            lbl = labels[idx] if idx < len(labels) else f"Klasse_{idx}"
-            probs[lbl] = float(prob)
+            probs_dict = {top_label: top_conf}
+        else:
+            return {
+                "label": "Keine Kleidung erkannt",
+                "confidence": 0.0,
+                "probabilities": {}
+            }
 
-        # Nach Wahrscheinlichkeit sortieren
-        sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
-        top_label, top_conf = sorted_probs[0]
-
-        threshold = config.get("confidence_threshold", 0.55)
+        threshold = config.get("confidence_threshold", 0.25)
         final_label = top_label if top_conf >= threshold else "Unbekannt / Nicht eindeutig"
 
         return {
             "label": final_label,
             "confidence": top_conf,
-            "probabilities": dict(sorted_probs[:3])
+            "probabilities": probs_dict
         }
 
     except Exception as e:
-        st.error(f"Fehler bei der KI-Bildanalyse: {e}")
+        st.error(f"Fehler bei der YOLO-Analyse: {e}")
         return {
             "label": "Fehler bei Analyse",
             "confidence": 0.0,
@@ -163,8 +156,8 @@ def predict_clothing(image_file) -> dict:
 
 
 def get_model_info() -> dict:
-    """Gibt Statusinformationen für den Admin-Bereich zurück."""
-    model = load_keras_model()
+    """Informationen für das Admin-Dashboard."""
+    model = load_yolo_model()
     labels = load_labels()
     config = load_config()
 
@@ -173,6 +166,7 @@ def get_model_info() -> dict:
 
     return {
         "model_loaded": model is not None,
+        "model_type": "YOLO (.pt)",
         "model_path": str(MODEL_PATH),
         "file_exists": file_exists,
         "file_size_mb": f"{file_size_mb} MB" if file_exists else "N/A",
