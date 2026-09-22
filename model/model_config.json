@@ -1,0 +1,4 @@
+{
+  "confidence_threshold": 0.25,
+  "model_type": "yolo"
+}
