@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import streamlit as st
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 # Pfade definieren (Hauptverzeichnis des Projekts & model/-Ordner)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,7 +20,7 @@ def load_config() -> dict:
                 return json.load(f)
         except Exception as e:
             st.warning(f"Fehler beim Laden von model_config.json: {e}")
-    return {"confidence_threshold": 0.25}
+    return {"confidence_threshold": 0.35}
 
 
 def load_labels() -> dict:
@@ -53,27 +53,33 @@ def load_labels() -> dict:
 def load_yolo_model():
     """
     Lädt das YOLO-Modell.
-    Nutzt 'model/best.pt', falls vorhanden.
-    Lädt andernfalls automatisch 'yolov8n.pt' direkt aus dem Internet herunter.
+    1. Nutzt 'model/best.pt', falls lokal vorhanden.
+    2. Lädt sonst ein auf Kleidung spezialisiertes Modell von Hugging Face.
+    3. Nutzt als Fallback das Standard-YOLOv8.
     """
+    from ultralytics import YOLO
+
+    # 1. Lokale Modelldatei prüfen
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1000000:
+        return YOLO(str(MODEL_PATH))
+
+    # 2. Spezialisiertes Kleidungsmodell von Hugging Face laden
     try:
-        from ultralytics import YOLO
-
-        if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1000000:
-            model_target = str(MODEL_PATH)
-        else:
-            # Automatischer Download des Standard-Modells
-            model_target = "yolov8n.pt"
-
-        model = YOLO(model_target)
-        return model
+        from huggingface_hub import hf_hub_download
+        model_file = hf_hub_download(
+            repo_id="keremberke/yolov8n-clothing-classification", 
+            filename="best.pt"
+        )
+        return YOLO(model_file)
     except Exception as e:
-        st.error(f"❌ Fehler beim Laden des YOLO-Modells: {e}")
-        return None
+        st.warning(f"Hugging Face Modell konnte nicht geladen werden, verwende Standard-YOLO: {e}")
+
+    # 3. Fallback auf Allzweckmodell
+    return YOLO("yolov8n.pt")
 
 
 def predict_clothing(image_file) -> dict:
-    """Führt die Bildanalyse mit dem YOLO-Modell durch."""
+    """Führt die Bildanalyse mit optimaler Bildaufbereitung durch."""
     model = load_yolo_model()
     config = load_config()
     custom_labels = load_labels()
@@ -86,21 +92,34 @@ def predict_clothing(image_file) -> dict:
         }
 
     try:
-        # Bild öffnen und Farbraum sichern
+        # 1. Bild öffnen & RGB erzwingen
         img = Image.open(image_file).convert("RGB")
 
-        # YOLO Vorhersage ausführen
-        results = model(img)
+        # 2. SCHRITT 2: Quadratisch ohne Verzerrung aufbereiten (640x640 mit weißem Rand)
+        img_padded = ImageOps.pad(img, (640, 640), color=(255, 255, 255))
+
+        # 3. Vorhersage ausführen
+        results = model(img_padded)
         result = results[0]
 
-        # Falls Bounding Boxes / Objekte erkannt wurden
-        if len(result.boxes) > 0:
-            # Box mit der höchsten Wahrscheinlichkeit auswählen
+        # 4. Auswertung für Klassifikationsmodell (probs vorhanden)
+        if hasattr(result, "probs") and result.probs is not None:
+            top_class_id = int(result.probs.top1)
+            confidence = float(result.probs.top1conf)
+
+            if top_class_id in custom_labels:
+                label_name = custom_labels[top_class_id]
+            elif hasattr(model, "names") and top_class_id in model.names:
+                label_name = model.names[top_class_id]
+            else:
+                label_name = f"Klasse_{top_class_id}"
+
+        # 5. Auswertung für Objekterkennungsmodell (boxes vorhanden)
+        elif len(result.boxes) > 0:
             best_box = max(result.boxes, key=lambda b: float(b.conf[0]))
             class_id = int(best_box.cls[0])
             confidence = float(best_box.conf[0])
 
-            # Label aus labels.txt oder direkt aus dem Modell holen
             if class_id in custom_labels:
                 label_name = custom_labels[class_id]
             elif hasattr(model, "names") and class_id in model.names:
@@ -108,22 +127,23 @@ def predict_clothing(image_file) -> dict:
             else:
                 label_name = f"Klasse_{class_id}"
 
-            # Schwellenwert prüfen
-            threshold = config.get("confidence_threshold", 0.25)
-            if confidence < threshold:
-                label_name = "Unbekannt / Nicht eindeutig"
-
-            return {
-                "label": label_name,
-                "confidence": confidence,
-                "probabilities": {label_name: confidence}
-            }
         else:
             return {
                 "label": "Sonstiges / Nicht erkannt",
                 "confidence": 0.0,
                 "probabilities": {}
             }
+
+        # 6. Schwellenwert prüfen (Standard: 0.35)
+        threshold = config.get("confidence_threshold", 0.35)
+        if confidence < threshold:
+            label_name = "Unbekannt / Nicht eindeutig"
+
+        return {
+            "label": label_name,
+            "confidence": confidence,
+            "probabilities": {label_name: confidence}
+        }
 
     except Exception as e:
         st.error(f"Fehler bei der Bildanalyse: {e}")
@@ -135,15 +155,15 @@ def predict_clothing(image_file) -> dict:
 
 
 def load_labels_list() -> list:
-    """Kompatibilitätsfunktion für das Upload-Formular."""
+    """Kompatibilitätsfunktion für Auswahllisten im Upload-Formular."""
     labels_dict = load_labels()
     if labels_dict:
         return [labels_dict[k] for k in sorted(labels_dict.keys())]
-    return ["T-Shirt", "Pullover", "Hose", "Schuhe", "Sonstiges"]
+    return ["T-Shirt", "Pullover", "Hose", "Schuhe", "Jacke", "Sonstiges"]
 
 
 def get_model_info() -> dict:
-    """Gibt Infos über den Modellstatus für das Dashboard aus."""
+    """Statusinfos für das Admin-Dashboard."""
     model = load_yolo_model()
     config = load_config()
     labels = load_labels()
