@@ -1,153 +1,125 @@
 import json
 from pathlib import Path
 import streamlit as st
-import numpy as np
 from PIL import Image, ImageOps
+import torch
+from transformers import CLIPProcessor, CLIPModel
 
-# Pfade definieren (Hauptverzeichnis des Projekts & model/-Ordner)
+# Pfade definieren
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_DIR = BASE_DIR / "model"
-MODEL_PATH = MODEL_DIR / "best.pt"
 CONFIG_PATH = MODEL_DIR / "model_config.json"
 LABELS_PATH = MODEL_DIR / "labels.txt"
 
 
 def load_config() -> dict:
-    """Lädt die Konfigurationsdatei aus dem model/-Ordner."""
+    """Lädt die Konfiguration aus model_config.json."""
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as e:
-            st.warning(f"Fehler beim Laden von model_config.json: {e}")
-    return {"confidence_threshold": 0.35}
+        except Exception:
+            pass
+    return {"confidence_threshold": 0.20}
 
 
-def load_labels() -> dict:
-    """
-    Lädt die Label-Zuordnung aus labels.txt.
-    Erwartetes Format: '0 T-Shirt' oder 'T-Shirt' (Zeile für Zeile).
-    """
+def load_labels() -> list:
+    """Lädt die Text-Labels aus labels.txt als Liste."""
+    default_labels = ["T-Shirt", "Pullover", "Hoodie", "Jacke", "Hose", "Jeans", "Schuhe", "Tasche"]
     if not LABELS_PATH.exists():
-        return {}
+        return default_labels
 
-    labels_map = {}
+    labels = []
     try:
         with open(LABELS_PATH, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 parts = line.split(" ", 1)
                 if len(parts) == 2 and parts[0].isdigit():
-                    labels_map[int(parts[0])] = parts[1].strip()
+                    labels.append(parts[1].strip())
                 else:
-                    labels_map[idx] = line
-        return labels_map
-    except Exception as e:
-        st.warning(f"Fehler beim Lesen von labels.txt: {e}")
-        return {}
+                    labels.append(line)
+        return labels if labels else default_labels
+    except Exception:
+        return default_labels
 
 
 @st.cache_resource
-def load_yolo_model():
-    """
-    Lädt das YOLO-Modell.
-    1. Nutzt 'model/best.pt', falls lokal vorhanden.
-    2. Versucht ein öffentliches Kleidungs-Modell von Hugging Face zu laden.
-    3. Nutzt als zuverlässigen Fallback 'yolov8n.pt'.
-    """
-    from ultralytics import YOLO
-
-    # 1. Lokale Modelldatei prüfen
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1000000:
-        return YOLO(str(MODEL_PATH))
-
-    # 2. Öffentliches HF-Modell laden (ohne Auth-Zwang)
+def load_clip_model():
+    """Lädt das CLIP-Modell und den Processor von Hugging Face."""
     try:
-        from huggingface_hub import hf_hub_download
-        model_file = hf_hub_download(
-            repo_id="BraveA/yolov8n-clothing",
-            filename="best.pt"
-        )
-        return YOLO(model_file)
-    except Exception:
-        # Falls HF blockiert, geräuschlos auf lokales/Standard YOLO umschalten
-        pass
-
-    # 3. Standard-Modell von Ultralytics laden (lädt automatisch und ohne Fehler)
-    return YOLO("yolov8n.pt")
+        model_id = "openai/clip-vit-base-patch32"
+        model = CLIPModel.from_pretrained(model_id)
+        processor = CLIPProcessor.from_pretrained(model_id)
+        return model, processor
+    except Exception as e:
+        st.error(f"Fehler beim Laden des CLIP-Modells: {e}")
+        return None, None
 
 
 def predict_clothing(image_file) -> dict:
-    """Führt die Bildanalyse mit optimaler Bildaufbereitung durch."""
-    model = load_yolo_model()
+    """Zero-Shot Klassifikation mit CLIP."""
+    model, processor = load_clip_model()
     config = load_config()
-    custom_labels = load_labels()
+    candidate_labels = load_labels()
 
-    if model is None:
+    if model is None or processor is None:
         return {
-            "label": "Sonstiges (Modell nicht geladen)",
+            "label": "Fehler (Modell nicht geladen)",
             "confidence": 0.0,
             "probabilities": {}
         }
 
     try:
-        # 1. Bild öffnen & RGB erzwingen
+        # Bild öffnen und aufbereiten
         img = Image.open(image_file).convert("RGB")
+        img_padded = ImageOps.pad(img, (224, 224), color=(255, 255, 255))
 
-        # 2. Quadratisch ohne Verzerrung aufbereiten (640x640 mit weißem Rand)
-        img_padded = ImageOps.pad(img, (640, 640), color=(255, 255, 255))
+        # Prompts für CLIP formulieren (z. B. "a photo of a T-Shirt")
+        text_prompts = [f"a photo of a {label}" for label in candidate_labels]
 
-        # 3. Vorhersage ausführen
-        results = model(img_padded)
-        result = results[0]
+        # Eingaben für das Modell vorbereiten
+        inputs = processor(
+            text=text_prompts,
+            images=img_padded,
+            return_tensors="pt",
+            padding=True
+        )
 
-        # 4. Auswertung für Klassifikationsmodell (probs vorhanden)
-        if hasattr(result, "probs") and result.probs is not None:
-            top_class_id = int(result.probs.top1)
-            confidence = float(result.probs.top1conf)
+        # Inferenz durchführen
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Softmax über die Logits zur Ermittlung der Wahrscheinlichkeiten
+            logits_per_image = outputs.logits_per_image
+            probs = logits_per_image.softmax(dim=1).squeeze().tolist()
 
-            if top_class_id in custom_labels:
-                label_name = custom_labels[top_class_id]
-            elif hasattr(model, "names") and top_class_id in model.names:
-                label_name = model.names[top_class_id]
-            else:
-                label_name = f"Klasse_{top_class_id}"
+        # Das wahrscheinlichste Label ermitteln
+        if isinstance(probs, float):  # Falls nur ein Label existiert
+            probs = [probs]
 
-        # 5. Auswertung für Objekterkennungsmodell (boxes vorhanden)
-        elif len(result.boxes) > 0:
-            best_box = max(result.boxes, key=lambda b: float(b.conf[0]))
-            class_id = int(best_box.cls[0])
-            confidence = float(best_box.conf[0])
+        best_idx = int(torch.argmax(torch.tensor(probs)))
+        confidence = float(probs[best_idx])
+        top_label = candidate_labels[best_idx]
 
-            if class_id in custom_labels:
-                label_name = custom_labels[class_id]
-            elif hasattr(model, "names") and class_id in model.names:
-                label_name = model.names[class_id]
-            else:
-                label_name = f"Klasse_{class_id}"
+        # Übersicht aller Wahrscheinlichkeiten erstellen
+        probs_dict = {
+            candidate_labels[i]: round(probs[i], 3)
+            for i in range(len(candidate_labels))
+        }
 
-        else:
-            return {
-                "label": "Sonstiges / Nicht erkannt",
-                "confidence": 0.0,
-                "probabilities": {}
-            }
-
-        # 6. Schwellenwert prüfen (Standard: 0.35)
-        threshold = config.get("confidence_threshold", 0.35)
-        if confidence < threshold:
-            label_name = "Unbekannt / Nicht eindeutig"
+        threshold = config.get("confidence_threshold", 0.20)
+        final_label = top_label if confidence >= threshold else "Unbekannt / Nicht eindeutig"
 
         return {
-            "label": label_name,
+            "label": final_label,
             "confidence": confidence,
-            "probabilities": {label_name: confidence}
+            "probabilities": probs_dict
         }
 
     except Exception as e:
-        st.error(f"Fehler bei der Bildanalyse: {e}")
+        st.error(f"Fehler bei der CLIP-Analyse: {e}")
         return {
             "label": "Fehler bei Analyse",
             "confidence": 0.0,
@@ -156,22 +128,20 @@ def predict_clothing(image_file) -> dict:
 
 
 def load_labels_list() -> list:
-    """Kompatibilitätsfunktion für Auswahllisten im Upload-Formular."""
-    labels_dict = load_labels()
-    if labels_dict:
-        return [labels_dict[k] for k in sorted(labels_dict.keys())]
-    return ["T-Shirt", "Pullover", "Hose", "Schuhe", "Jacke", "Sonstiges"]
+    """Gibt die Liste der Labels für UI-Auswahllisten zurück."""
+    return load_labels()
 
 
 def get_model_info() -> dict:
-    """Statusinfos für das Admin-Dashboard."""
-    model = load_yolo_model()
-    config = load_config()
+    """Statusinformationen für das Admin-Dashboard."""
+    model, _ = load_clip_model()
     labels = load_labels()
+    config = load_config()
 
     return {
         "model_loaded": model is not None,
-        "uses_custom_file": MODEL_PATH.exists(),
+        "model_type": "CLIP Zero-Shot (openai/clip-vit-base-patch32)",
         "labels_count": len(labels),
+        "labels": labels,
         "config": config
     }
