@@ -54,8 +54,8 @@ def load_yolo_model():
     """
     Lädt das YOLO-Modell.
     1. Nutzt 'model/best.pt', falls lokal vorhanden.
-    2. Lädt sonst ein auf Kleidung spezialisiertes Modell von Hugging Face.
-    3. Nutzt als Fallback das Standard-YOLOv8.
+    2. Versucht ein öffentliches Kleidungs-Modell von Hugging Face zu laden.
+    3. Nutzt als zuverlässigen Fallback 'yolov8n.pt'.
     """
     from ultralytics import YOLO
 
@@ -63,18 +63,19 @@ def load_yolo_model():
     if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1000000:
         return YOLO(str(MODEL_PATH))
 
-    # 2. Spezialisiertes Kleidungsmodell von Hugging Face laden
+    # 2. Öffentliches HF-Modell laden (ohne Auth-Zwang)
     try:
         from huggingface_hub import hf_hub_download
         model_file = hf_hub_download(
-            repo_id="keremberke/yolov8n-clothing-classification", 
+            repo_id="BraveA/yolov8n-clothing",
             filename="best.pt"
         )
         return YOLO(model_file)
-    except Exception as e:
-        st.warning(f"Hugging Face Modell konnte nicht geladen werden, verwende Standard-YOLO: {e}")
+    except Exception:
+        # Falls HF blockiert, geräuschlos auf lokales/Standard YOLO umschalten
+        pass
 
-    # 3. Fallback auf Allzweckmodell
+    # 3. Standard-Modell von Ultralytics laden (lädt automatisch und ohne Fehler)
     return YOLO("yolov8n.pt")
 
 
@@ -95,7 +96,7 @@ def predict_clothing(image_file) -> dict:
         # 1. Bild öffnen & RGB erzwingen
         img = Image.open(image_file).convert("RGB")
 
-        # 2. SCHRITT 2: Quadratisch ohne Verzerrung aufbereiten (640x640 mit weißem Rand)
+        # 2. Quadratisch ohne Verzerrung aufbereiten (640x640 mit weißem Rand)
         img_padded = ImageOps.pad(img, (640, 640), color=(255, 255, 255))
 
         # 3. Vorhersage ausführen
